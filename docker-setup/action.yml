@@ -1,0 +1,170 @@
+name: 'Docker Setup'
+description: 'Install and configure Docker on remote servers via SSH with production-grade configuration'
+author: 'MBBe-Software'
+
+inputs:
+  host:
+    description: 'Server hostname or IP address'
+    required: true
+  username:
+    description: 'SSH username'
+    required: true
+  ssh-key:
+    description: 'SSH private key for authentication'
+    required: true
+  docker-version:
+    description: 'Docker version to install (default: latest)'
+    required: false
+    default: 'latest'
+  compose-plugin:
+    description: 'Install Docker Compose plugin (default: true)'
+    required: false
+    default: 'true'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Docker on Remote Server
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ inputs.host }}
+        username: ${{ inputs.username }}
+        key: ${{ inputs.ssh-key }}
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+          
+          echo "🐳 Starting Docker installation process..."
+          echo "📍 Target server: ${{ inputs.host }}"
+          echo "👤 User: ${{ inputs.username }}"
+          echo "🔧 Docker version: ${{ inputs.docker-version }}"
+          echo "📦 Compose plugin: ${{ inputs.compose-plugin }}"
+          
+          # Function to log with timestamp
+          log() {
+            echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"
+          }
+          
+          # Function to check if Docker is already installed and working
+          check_docker() {
+            if command -v docker >/dev/null 2>&1; then
+              if docker --version >/dev/null 2>&1; then
+                log "✅ Docker is already installed: $(docker --version)"
+                if docker compose version >/dev/null 2>&1; then
+                  log "✅ Docker Compose is already available: $(docker compose version)"
+                  return 0
+                fi
+              fi
+            fi
+            return 1
+          }
+          
+          # Check if Docker is already properly installed
+          if check_docker; then
+            log "🎉 Docker and Docker Compose are already properly installed"
+            exit 0
+          fi
+          
+          log "📋 Docker not found or not working properly. Installing..."
+          
+          # Update system packages
+          log "🔄 Updating system packages..."
+          apt-get update -qq
+          
+          # Install required packages for Docker installation
+          log "📦 Installing prerequisites..."
+          apt-get install -y -qq \
+            ca-certificates \
+            curl \
+            gnupg \
+            lsb-release \
+            software-properties-common \
+            apt-transport-https
+          
+          # Add Docker's official GPG key
+          log "🔑 Adding Docker GPG key..."
+          install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+          chmod a+r /etc/apt/keyrings/docker.gpg
+          
+          # Add Docker repository
+          log "📦 Adding Docker repository..."
+          echo \
+            "deb [arch="$(dpkg --print-architecture)" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+            "$(. /etc/os-release && echo "$VERSION_CODENAME")" stable" | \
+            tee /etc/apt/sources.list.d/docker.list > /dev/null
+          
+          # Update package index with Docker repo
+          log "🔄 Updating package index..."
+          apt-get update -qq
+          
+          # Install Docker Engine
+          log "🐳 Installing Docker Engine..."
+          if [ "${{ inputs.docker-version }}" = "latest" ]; then
+            apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin
+          else
+            # Install specific version (future enhancement)
+            apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin
+          fi
+          
+          # Install Docker Compose plugin if requested
+          if [ "${{ inputs.compose-plugin }}" = "true" ]; then
+            log "📦 Installing Docker Compose plugin..."
+            apt-get install -y -qq docker-compose-plugin
+          fi
+          
+          # Configure Docker daemon with production settings
+          log "⚙️ Configuring Docker daemon..."
+          mkdir -p /etc/docker
+          cat > /etc/docker/daemon.json << 'EOF'
+          {
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "10m",
+              "max-file": "3"
+            },
+            "storage-driver": "overlay2",
+            "userland-proxy": false,
+            "experimental": false,
+            "live-restore": true
+          }
+          EOF
+          
+          # Start and enable Docker service
+          log "🚀 Starting Docker service..."
+          systemctl enable docker
+          systemctl start docker
+          
+          # Add current user to docker group (if not root)
+          if [ "${{ inputs.username }}" != "root" ]; then
+            log "👥 Adding user ${{ inputs.username }} to docker group..."
+            usermod -aG docker ${{ inputs.username }}
+          fi
+          
+          # Verify installation
+          log "🔍 Verifying Docker installation..."
+          docker --version
+          docker info >/dev/null
+          
+          if [ "${{ inputs.compose-plugin }}" = "true" ]; then
+            log "🔍 Verifying Docker Compose..."
+            docker compose version
+          fi
+          
+          # Test Docker with hello-world
+          log "🧪 Testing Docker with hello-world..."
+          docker run --rm hello-world >/dev/null
+          
+          # Clean up hello-world image
+          docker rmi hello-world:latest >/dev/null 2>&1 || true
+          
+          log "✅ Docker installation completed successfully!"
+          log "📊 Docker info:"
+          docker --version
+          if [ "${{ inputs.compose-plugin }}" = "true" ]; then
+            docker compose version
+          fi
+
+branding:
+  icon: 'package'
+  color: 'blue'
