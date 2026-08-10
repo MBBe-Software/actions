@@ -94,6 +94,8 @@ jobs:
           ADMIN_EMAIL: ci@example.invalid
           ADMIN_PASSWORD: ci-only-admin-password
           ADMIN_PHONE: "05550000000"
+          APP_DB_PASSWORD: ci-only-app-db-password
+          MIGRATION_DB_PASSWORD: ci-only-migration-db-password
         run: |
           set -euo pipefail
           docker compose -f "$COMPOSE_FILE" config >/dev/null
@@ -170,7 +172,11 @@ jobs:
           def call(method, endpoint, body=None):
               url = f"{base}/api/{endpoint}"
               data = json.dumps(body).encode() if body is not None else None
-              headers = {"accept": "application/json", "x-api-key": api_key}
+              headers = {
+                  "accept": "application/json",
+                  "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+                  "x-api-key": api_key,
+              }
               if body is not None:
                   headers["content-type"] = "application/json"
               request = urllib.request.Request(url, data=data, headers=headers, method=method)
