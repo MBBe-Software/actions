@@ -1,0 +1,233 @@
+name: Reusable Dokploy Compose Deploy
+
+on:
+  workflow_call:
+    inputs:
+      manifest-path:
+        description: Path to the repository's Dokploy deployment manifest
+        required: false
+        type: string
+        default: .deploy/dokploy.json
+    secrets:
+      DOKPLOY_URL:
+        required: true
+      DOKPLOY_API_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: Validate deployment manifest
+    runs-on: ubuntu-latest
+    outputs:
+      compose_id: ${{ steps.manifest.outputs.compose_id }}
+      compose_file: ${{ steps.manifest.outputs.compose_file }}
+      public_url: ${{ steps.manifest.outputs.public_url }}
+      images: ${{ steps.manifest.outputs.images }}
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+
+      - name: Read and validate manifest
+        id: manifest
+        env:
+          MANIFEST_PATH: ${{ inputs.manifest-path }}
+        run: |
+          set -euo pipefail
+          test -f "$MANIFEST_PATH"
+          python3 - "$MANIFEST_PATH" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          data = json.loads(path.read_text())
+          required = ("compose_id", "compose_file", "public_url", "images")
+          missing = [key for key in required if not data.get(key)]
+          if missing:
+              raise SystemExit(f"Missing manifest keys: {', '.join(missing)}")
+          if not isinstance(data["images"], list) or not data["images"]:
+              raise SystemExit("images must be a non-empty list")
+          for index, image in enumerate(data["images"]):
+              for key in ("env", "name", "context", "file", "cache_scope"):
+                  if not image.get(key):
+                      raise SystemExit(f"images[{index}] is missing {key}")
+              if not image["name"].startswith("ghcr.io/"):
+                  raise SystemExit(f"images[{index}].name must be a GHCR image")
+          compose_path = pathlib.Path(data["compose_file"])
+          if not compose_path.is_file():
+              raise SystemExit(f"Compose file does not exist: {compose_path}")
+          compose = compose_path.read_text()
+          forbidden = ("TODO", "FIXME", "CHANGE_ME", "REPLACE_ME", "example.com")
+          found = [marker for marker in forbidden if marker.lower() in compose.lower()]
+          if found:
+              raise SystemExit(f"Compose file contains unresolved markers: {', '.join(found)}")
+          print(f"Manifest OK: {path}")
+          PY
+          echo "compose_id=$(jq -r '.compose_id' "$MANIFEST_PATH")" >> "$GITHUB_OUTPUT"
+          echo "compose_file=$(jq -r '.compose_file' "$MANIFEST_PATH")" >> "$GITHUB_OUTPUT"
+          echo "public_url=$(jq -r '.public_url' "$MANIFEST_PATH")" >> "$GITHUB_OUTPUT"
+          echo "images=$(jq -c '.images' "$MANIFEST_PATH")" >> "$GITHUB_OUTPUT"
+
+  validate:
+    name: Validate Compose configuration
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+
+      - name: Validate Compose syntax
+        env:
+          COMPOSE_FILE: ${{ needs.prepare.outputs.compose_file }}
+          API_IMAGE: ghcr.io/mbbe-software/ci-placeholder/api:ci
+          WEB_IMAGE: ghcr.io/mbbe-software/ci-placeholder/web:ci
+          FRONTEND_IMAGE: ghcr.io/mbbe-software/ci-placeholder/frontend:ci
+          MIGRATIONS_IMAGE: ghcr.io/mbbe-software/ci-placeholder/migrations:ci
+          POSTGRES_PASSWORD: ci-only-placeholder-password
+          JWT_SECRET: ci-only-jwt-secret-with-more-than-32-characters
+          JWT_ISSUER: ci-api
+          JWT_AUDIENCE: ci-client
+          FRONTEND_ORIGIN: https://ci.example.invalid
+          ADMIN_EMAIL: ci@example.invalid
+          ADMIN_PASSWORD: ci-only-admin-password
+          ADMIN_PHONE: "05550000000"
+        run: |
+          set -euo pipefail
+          docker compose -f "$COMPOSE_FILE" config >/dev/null
+
+  build:
+    name: Build and publish ${{ matrix.image.env }}
+    needs: [prepare, validate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        image: ${{ fromJSON(needs.prepare.outputs.images) }}
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push immutable image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.image.context }}
+          file: ${{ matrix.image.file }}
+          push: true
+          tags: ${{ matrix.image.name }}:sha-${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.image.cache_scope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.cache_scope }}
+
+  deploy:
+    name: Deploy to Dokploy
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: dokploy-${{ needs.prepare.outputs.compose_id }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+
+      - name: Synchronize Compose and immutable image references
+        env:
+          DOKPLOY_URL: ${{ secrets.DOKPLOY_URL }}
+          DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
+          DOKPLOY_COMPOSE_ID: ${{ needs.prepare.outputs.compose_id }}
+          COMPOSE_FILE: ${{ needs.prepare.outputs.compose_file }}
+          IMAGES_JSON: ${{ needs.prepare.outputs.images }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.parse
+          import urllib.request
+
+          base = os.environ["DOKPLOY_URL"].rstrip("/")
+          api_key = os.environ["DOKPLOY_API_KEY"]
+          compose_id = os.environ["DOKPLOY_COMPOSE_ID"]
+          compose_file = os.environ["COMPOSE_FILE"]
+          images = json.loads(os.environ["IMAGES_JSON"])
+
+          def call(method, endpoint, body=None):
+              url = f"{base}/api/{endpoint}"
+              data = json.dumps(body).encode() if body is not None else None
+              headers = {"accept": "application/json", "x-api-key": api_key}
+              if body is not None:
+                  headers["content-type"] = "application/json"
+              request = urllib.request.Request(url, data=data, headers=headers, method=method)
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  raw = response.read().decode()
+              return json.loads(raw) if raw else {}
+
+          compose = call("GET", f"compose.one?{urllib.parse.urlencode({'composeId': compose_id})}")
+          if compose.get("composeId") != compose_id:
+              raise SystemExit("Dokploy returned an unexpected compose ID")
+          env_lines = []
+          updates = {
+              image["env"]: f"{image['name']}:sha-{os.environ['GITHUB_SHA']}"
+              for image in images
+          }
+          seen = set()
+          for line in (compose.get("env") or "").splitlines():
+              if not line.strip() or line.lstrip().startswith("#") or "=" not in line:
+                  env_lines.append(line)
+                  continue
+              key, _ = line.split("=", 1)
+              if key in updates:
+                  env_lines.append(f"{key}={updates[key]}")
+                  seen.add(key)
+              else:
+                  env_lines.append(line)
+          for key, value in updates.items():
+              if key not in seen:
+                  env_lines.append(f"{key}={value}")
+
+          compose_text = open(compose_file, encoding="utf-8").read()
+          call("POST", "compose.update", {
+              "composeId": compose_id,
+              "composeFile": compose_text,
+              "env": "\n".join(env_lines) + "\n",
+          })
+          call("GET", f"compose.one?{urllib.parse.urlencode({'composeId': compose_id})}")
+          call("POST", "compose.deploy", {
+              "composeId": compose_id,
+              "title": f"GitHub {os.environ['GITHUB_SHA']}",
+          })
+          for _ in range(72):
+              current = call("GET", f"compose.one?{urllib.parse.urlencode({'composeId': compose_id})}")
+              status = current.get("composeStatus")
+              if status == "done":
+                  print("Dokploy deployment completed")
+                  break
+              if status == "error":
+                  raise SystemExit("Dokploy deployment reported error")
+              time.sleep(10)
+          else:
+              raise SystemExit("Timed out waiting for Dokploy deployment")
+          PY
+
+      - name: Public smoke check
+        env:
+          PUBLIC_URL: ${{ needs.prepare.outputs.public_url }}
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --max-time 30 "$PUBLIC_URL/" >/dev/null
