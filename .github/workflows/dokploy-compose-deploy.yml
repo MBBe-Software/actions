@@ -236,4 +236,13 @@ jobs:
           PUBLIC_URL: ${{ needs.prepare.outputs.public_url }}
         run: |
           set -euo pipefail
-          curl --fail --silent --show-error --max-time 30 "$PUBLIC_URL/" >/dev/null
+          for attempt in $(seq 1 24); do
+            if curl --fail --silent --show-error --max-time 15 "$PUBLIC_URL/" >/dev/null; then
+              echo "Public smoke check passed"
+              exit 0
+            fi
+            echo "Public endpoint not ready (attempt $attempt/24)" >&2
+            sleep 5
+          done
+          echo "Public smoke check timed out" >&2
+          exit 1
